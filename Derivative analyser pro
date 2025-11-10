@@ -1,0 +1,301 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from typing import Dict, List, Tuple, Optional
+
+class DerivativeAnalyzer:
+    """
+    A comprehensive derivative trading analyzer for options and futures
+    """
+    
+    def __init__(self, risk_free_rate: float = 0.05):
+        self.risk_free_rate = risk_free_rate
+        self.portfolio = {}
+        
+    def black_scholes(self, S: float, K: float, T: float, sigma: float, 
+                     option_type: str, q: float = 0) -> Dict:
+        """
+        Calculate Black-Scholes option price and Greeks
+        """
+        if T <= 0:
+            if option_type == 'call':
+                price = max(S - K, 0)
+            else:
+                price = max(K - S, 0)
+            return {'price': price, 'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0, 'rho': 0}
+        
+        d1 = (np.log(S / K) + (self.risk_free_rate - q + sigma**2 / 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        
+        if option_type == 'call':
+            price = S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-self.risk_free_rate * T) * norm.cdf(d2)
+            delta = np.exp(-q * T) * norm.cdf(d1)
+            rho = K * T * np.exp(-self.risk_free_rate * T) * norm.cdf(d2)
+        else:  # put
+            price = K * np.exp(-self.risk_free_rate * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+            delta = np.exp(-q * T) * (norm.cdf(d1) - 1)
+            rho = -K * T * np.exp(-self.risk_free_rate * T) * norm.cdf(-d2)
+        
+        gamma = np.exp(-q * T) * norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        vega = S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+        theta = (-S * np.exp(-q * T) * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
+                - self.risk_free_rate * K * np.exp(-self.risk_free_rate * T) * 
+                (norm.cdf(d2) if option_type == 'call' else norm.cdf(-d2)))
+        
+        return {
+            'price': price,
+            'delta': delta,
+            'gamma': gamma,
+            'theta': theta,
+            'vega': vega,
+            'rho': rho
+        }
+    
+    def add_position(self, symbol: str, underlying_price: float, strike: float, 
+                    expiration: datetime, volatility: float, option_type: str = None,
+                    position_type: str = 'option', quantity: int = 1, 
+                    entry_price: float = None, current_date: datetime = None):
+        """
+        Add a position to the portfolio
+        """
+        if current_date is None:
+            current_date = datetime.now()
+        
+        time_to_expiry = (expiration - current_date).days / 365.0
+        
+        if position_type == 'option':
+            if option_type is None:
+                raise ValueError("Option type must be specified for option positions")
+            
+            greeks = self.black_scholes(underlying_price, strike, time_to_expiry, 
+                                      volatility, option_type)
+            
+            if entry_price is None:
+                entry_price = greeks['price']
+            
+            self.portfolio[symbol] = {
+                'type': 'option',
+                'option_type': option_type,
+                'underlying_price': underlying_price,
+                'strike': strike,
+                'expiration': expiration,
+                'volatility': volatility,
+                'quantity': quantity,
+                'entry_price': entry_price,
+                'current_price': greeks['price'],
+                'greeks': greeks,
+                'time_to_expiry': time_to_expiry
+            }
+        
+        elif position_type == 'future':
+            self.portfolio[symbol] = {
+                'type': 'future',
+                'underlying_price': underlying_price,
+                'quantity': quantity,
+                'entry_price': entry_price if entry_price else underlying_price,
+                'current_price': underlying_price
+            }
+    
+    def calculate_portfolio_greeks(self) -> Dict:
+        """
+        Calculate aggregate Greeks for the entire portfolio
+        """
+        portfolio_greeks = {
+            'delta': 0,
+            'gamma': 0,
+            'theta': 0,
+            'vega': 0,
+            'rho': 0
+        }
+        
+        for symbol, position in self.portfolio.items():
+            if position['type'] == 'option':
+                for greek in portfolio_greeks.keys():
+                    portfolio_greeks[greek] += position['greeks'][greek] * position['quantity']
+            elif position['type'] == 'future':
+                # Futures have delta of 1
+                portfolio_greeks['delta'] += position['quantity']
+        
+        return portfolio_greeks
+    
+    def profit_loss_analysis(self, underlying_price_change: float = 0, 
+                           volatility_change: float = 0, time_passed: int = 0) -> Dict:
+        """
+        Analyze P&L under different scenarios
+        """
+        results = {}
+        total_pnl = 0
+        
+        for symbol, position in self.portfolio.items():
+            if position['type'] == 'option':
+                new_underlying = position['underlying_price'] * (1 + underlying_price_change)
+                new_volatility = position['volatility'] + volatility_change
+                new_time = max(0, position['time_to_expiry'] - time_passed/365.0)
+                
+                new_greeks = self.black_scholes(new_underlying, position['strike'], 
+                                              new_time, new_volatility, 
+                                              position['option_type'])
+                
+                pnl = (new_greeks['price'] - position['entry_price']) * position['quantity']
+                results[symbol] = {
+                    'pnl': pnl,
+                    'pnl_percent': (new_greeks['price'] / position['entry_price'] - 1) * 100,
+                    'new_price': new_greeks['price'],
+                    'new_greeks': new_greeks
+                }
+                total_pnl += pnl
+            
+            elif position['type'] == 'future':
+                new_price = position['underlying_price'] * (1 + underlying_price_change)
+                pnl = (new_price - position['entry_price']) * position['quantity']
+                results[symbol] = {
+                    'pnl': pnl,
+                    'pnl_percent': (new_price / position['entry_price'] - 1) * 100,
+                    'new_price': new_price
+                }
+                total_pnl += pnl
+        
+        results['total_pnl'] = total_pnl
+        return results
+    
+    def risk_metrics(self) -> Dict:
+        """
+        Calculate various risk metrics for the portfolio
+        """
+        greeks = self.calculate_portfolio_greeks()
+        
+        # Value at Risk approximation (1-day, 95% confidence)
+        portfolio_value = sum(pos['current_price'] * abs(pos['quantity']) 
+                            for pos in self.portfolio.values())
+        
+        # Simplified VaR calculation
+        var_95 = portfolio_value * 0.05  # 5% move assumption
+        
+        risk_metrics = {
+            'portfolio_delta': greeks['delta'],
+            'portfolio_gamma': greeks['gamma'],
+            'portfolio_theta': greeks['theta'],
+            'portfolio_vega': greeks['vega'],
+            'portfolio_rho': greeks['rho'],
+            'var_95': var_95,
+            'portfolio_value': portfolio_value,
+            'position_count': len(self.portfolio),
+            'diversification_score': self.calculate_diversification_score()
+        }
+        
+        return risk_metrics
+    
+    def calculate_diversification_score(self) -> float:
+        """
+        Calculate a simple diversification score (0-1)
+        """
+        if len(self.portfolio) <= 1:
+            return 0.0
+        
+        # Simple diversification based on position sizes and types
+        option_count = sum(1 for pos in self.portfolio.values() if pos['type'] == 'option')
+        future_count = sum(1 for pos in self.portfolio.values() if pos['type'] == 'future')
+        
+        type_diversity = min(option_count / len(self.portfolio), 
+                           future_count / len(self.portfolio)) * 2
+        
+        return min(type_diversity, 1.0)
+    
+    def generate_greek_sensitivity_data(self, greek_type: str, price_range: Tuple[float, float] = (0.8, 1.2)):
+        """
+        Generate data for Greek sensitivity analysis
+        """
+        if not self.portfolio:
+            return None, None
+        
+        # Get first option position for analysis
+        option_positions = [pos for pos in self.portfolio.values() if pos['type'] == 'option']
+        if not option_positions:
+            return None, None
+        
+        position = option_positions[0]
+        current_price = position['underlying_price']
+        price_range_pct = np.linspace(price_range[0], price_range[1], 50)
+        prices = current_price * price_range_pct
+        greeks = []
+        
+        for price in prices:
+            greek_val = self.black_scholes(price, position['strike'], 
+                                         position['time_to_expiry'],
+                                         position['volatility'], 
+                                         position['option_type'])[greek_type]
+            greeks.append(greek_val)
+        
+        return prices, greeks
+
+    def get_portfolio_summary(self) -> pd.DataFrame:
+        """
+        Get portfolio summary as DataFrame
+        """
+        data = []
+        for symbol, position in self.portfolio.items():
+            row = {
+                'Symbol': symbol,
+                'Type': position['type'],
+                'Quantity': position['quantity'],
+                'Entry Price': position.get('entry_price', 0),
+                'Current Price': position.get('current_price', 0),
+                'Underlying Price': position.get('underlying_price', 0)
+            }
+            if position['type'] == 'option':
+                row['Option Type'] = position['option_type']
+                row['Strike'] = position['strike']
+                row['Expiration'] = position['expiration'].strftime('%Y-%m-%d')
+                row['Volatility'] = position['volatility']
+            data.append(row)
+        
+        return pd.DataFrame(data)
+
+def calculate_implied_volatility(S: float, K: float, T: float, market_price: float, 
+                               option_type: str, risk_free_rate: float = 0.05, 
+                               q: float = 0, max_iter: int = 100) -> float:
+    """
+    Calculate implied volatility using Newton-Raphson method
+    """
+    def black_scholes_price(sigma):
+        if T <= 0:
+            if option_type == 'call':
+                return max(S - K, 0)
+            else:
+                return max(K - S, 0)
+                
+        d1 = (np.log(S / K) + (risk_free_rate - q + sigma**2 / 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        
+        if option_type == 'call':
+            return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-risk_free_rate * T) * norm.cdf(d2)
+        else:
+            return K * np.exp(-risk_free_rate * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+    
+    def vega(sigma):
+        if T <= 0:
+            return 0
+        d1 = (np.log(S / K) + (risk_free_rate - q + sigma**2 / 2) * T) / (sigma * np.sqrt(T))
+        return S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+    
+    sigma = 0.3  # Initial guess
+    for i in range(max_iter):
+        price = black_scholes_price(sigma)
+        v = vega(sigma)
+        diff = market_price - price
+        
+        if abs(diff) < 0.0001:
+            return sigma
+        
+        # Avoid division by very small vega
+        if abs(v) < 1e-10:
+            break
+            
+        sigma = sigma + diff / v
+    
+    return sigma
